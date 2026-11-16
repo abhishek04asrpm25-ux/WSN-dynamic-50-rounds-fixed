@@ -1,4 +1,3 @@
-from simulation.multi_algorithm_runner import MultiAlgorithmSimulationRunner
 from pathlib import Path
 import json
 import math
@@ -10,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from simulation.network import generate_network
-from simulation.algorithms.ga_ch_selection import GeneticAlgorithmCHSelector
+from simulation.algorithms.ann_ch_selection import ANNClusterHeadSelector
 from simulation.clustering import ClusterManager
 
 
@@ -205,28 +204,33 @@ def get_clustered_network_deployment():
         config = load_config()
         communication_range, range_mode = get_communication_range(config)
 
-        # 1. Generate a fresh network deployment.
+        # Generate a fresh network deployment.
         network = generate_network(config, communication_range)
 
-        # 2. Run the Genetic Algorithm to select Cluster Heads.
-        ga_selector = GeneticAlgorithmCHSelector(
-            config,
-            communication_range,
+        # ANN is the only cluster-head selection algorithm.
+        ann_selector = ANNClusterHeadSelector(
+            num_cluster_heads=config["simulation"].get(
+                "num_cluster_heads", 10
+            ),
+            random_seed=42,
+            communication_range=communication_range,
+            initial_energy=config["network"]["initial_energy_j"],
         )
 
-        ga_result = ga_selector.select_cluster_heads(network)
+        ann_training_result = ann_selector.train()
+        ann_result = ann_selector.select_cluster_heads(
+            nodes=network["nodes"],
+            base_station=network["base_station"],
+        )
+        selected_ch_ids = ann_result["selected_ch_ids"]
 
-        selected_ch_ids = ga_result["selected_ch_ids"]
-
-        # 3. Form final clusters using ClusterManager.
+        # Form clusters around the ANN-selected cluster heads.
         cluster_manager = ClusterManager(communication_range)
-
         cluster_result = cluster_manager.form_clusters(
             network,
             selected_ch_ids,
         )
 
-        # 4. Convert network nodes into JSON-friendly records.
         nodes = serialize_nodes(network["nodes"])
 
         base_station_data = network["base_station"]
@@ -235,31 +239,27 @@ def get_clustered_network_deployment():
             "y": float(base_station_data["y"]),
         }
 
-        # 5. Create physical links for reference and later routing.
         physical_links = build_physical_links(
             nodes,
             base_station,
             communication_range,
         )
 
-        # 6. Create clear cluster-membership links for visualization.
-        # Each normal node connects to its assigned Cluster Head.
         visualization_links = []
+        node_map = {node["id"]: node for node in nodes}
 
-        node_map = {
-            node["id"]: node
-            for node in nodes
-        }
-
+        # Normal-node to cluster-head visualization links.
         for ch_id, member_ids in cluster_result["clusters"].items():
+            if ch_id not in node_map:
+                continue
+
             ch = node_map[ch_id]
 
             for member_id in member_ids:
-                if member_id == ch_id:
+                if member_id == ch_id or member_id not in node_map:
                     continue
 
                 member = node_map[member_id]
-
                 distance = math.hypot(
                     member["x"] - ch["x"],
                     member["y"] - ch["y"],
@@ -272,13 +272,18 @@ def get_clustered_network_deployment():
                     "type": "cluster",
                 })
 
-        # 7. Show communication links between selected CHs.
+        # Communication links between selected cluster heads.
         for index, ch_id_a in enumerate(selected_ch_ids):
+            if ch_id_a not in node_map:
+                continue
+
             ch_a = node_map[ch_id_a]
 
             for ch_id_b in selected_ch_ids[index + 1:]:
-                ch_b = node_map[ch_id_b]
+                if ch_id_b not in node_map:
+                    continue
 
+                ch_b = node_map[ch_id_b]
                 distance = math.hypot(
                     ch_a["x"] - ch_b["x"],
                     ch_a["y"] - ch_b["y"],
@@ -292,10 +297,12 @@ def get_clustered_network_deployment():
                         "type": "ch_connectivity",
                     })
 
-        # 8. Show direct links from gateway CHs to the BS.
+        # Direct communication links from cluster heads to the BS.
         for ch_id in selected_ch_ids:
-            ch = node_map[ch_id]
+            if ch_id not in node_map:
+                continue
 
+            ch = node_map[ch_id]
             distance = math.hypot(
                 ch["x"] - base_station["x"],
                 ch["y"] - base_station["y"],
@@ -319,15 +326,10 @@ def get_clustered_network_deployment():
                 "range_mode": range_mode,
                 "base_station": base_station,
                 "nodes": nodes,
-
-                # Cluster links and CH connectivity for the topology view.
                 "links": visualization_links,
                 "total_links": len(visualization_links),
-
-                # Complete physical graph for later routing algorithms.
                 "physical_links": physical_links,
                 "total_physical_links": len(physical_links),
-
                 "selected_ch_ids": selected_ch_ids,
                 "clusters": cluster_result["clusters"],
                 "cluster_metrics": {
@@ -336,14 +338,16 @@ def get_clustered_network_deployment():
                     "unassigned_node_ids": cluster_result["unassigned_node_ids"],
                     "coverage": cluster_result["coverage"],
                 },
-                "ga": {
-                    "fitness": ga_result["fitness"],
-                    "metrics": ga_result["metrics"],
-                    "history": ga_result["history"],
+                "cluster_head_algorithm": "ANN",
+                "ann": {
+                    "scores": ann_result["scores"],
+                    "training": ann_training_result,
                 },
             },
         }
 
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error))
     except (KeyError, TypeError, ValueError) as error:
         raise HTTPException(
             status_code=500,
@@ -354,6 +358,8 @@ def get_clustered_network_deployment():
             status_code=500,
             detail=f"Unexpected clustered deployment error: {error}",
         )
+
+
 @app.post("/api/simulation/run")
 def run_simulation(
     rounds: int = Query(default=1, ge=1, le=200)
@@ -546,100 +552,4 @@ def run_all_algorithms(
         raise HTTPException(
             status_code=500,
             detail=f"Six-algorithm simulation failed: {error}"
-        )
-
-
-def run_all_algorithms(
-    rounds: int = Query(default=1, ge=1, le=200)
-):
-    try:
-        config = load_config()
-
-        runner = MultiAlgorithmSimulationRunner(config)
-
-        result = runner.run(
-            number_of_rounds=rounds
-        )
-
-        # Add visualization information to every algorithm's history.
-        for algorithm_key, algorithm_result in result["results"].items():
-
-            for snapshot in algorithm_result["history"]:
-
-                base_station = snapshot.get(
-                    "base_station",
-                    runner.initial_network["base_station"]
-                )
-
-                snapshot["base_station"] = {
-                    "x": float(base_station["x"]),
-                    "y": float(base_station["y"]),
-                }
-
-                snapshot["communication_range_m"] = (
-                    runner.communication_range
-                )
-
-                snapshot["area_width"] = config["network"]["area_width"]
-                snapshot["area_height"] = config["network"]["area_height"]
-
-                snapshot["links"] = []
-
-                node_map = {
-                    node["id"]: node
-                    for node in snapshot["nodes"]
-                }
-
-                # Cluster membership links.
-                for ch_id, members in snapshot["clusters"].items():
-
-                    for member_id in members:
-
-                        if member_id == ch_id:
-                            continue
-
-                        a = node_map[member_id]
-                        b = node_map[ch_id]
-
-                        snapshot["links"].append({
-                            "source": member_id,
-                            "target": ch_id,
-                            "type": "cluster",
-                            "distance": round(
-                                math.hypot(
-                                    a["x"] - b["x"],
-                                    a["y"] - b["y"]
-                                ), 3
-                            ),
-                        })
-
-                # Actual multi-hop routing links.
-                for child, parent in snapshot["parent_map"].items():
-
-                    a = node_map[child]
-
-                    b = (
-                        snapshot["base_station"]
-                        if parent == "BS"
-                        else node_map[parent]
-                    )
-
-                    snapshot["links"].append({
-                        "source": child,
-                        "target": parent,
-                        "type": "route",
-                        "distance": round(
-                            math.hypot(
-                                a["x"] - b["x"],
-                                a["y"] - b["y"]
-                            ), 3
-                        ),
-                    })
-
-        return result
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Multi-algorithm simulation failed: {error}"
         )
